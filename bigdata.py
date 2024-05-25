@@ -56,6 +56,7 @@ if __name__ == "__main__":
     fetch_data_and_send_to_kafka(url)
 
 !pip install confluent_kafka pymongo
+!pip install pymongo
 
 from confluent_kafka import Consumer, KafkaException, KafkaError
 from pymongo import MongoClient
@@ -114,13 +115,43 @@ if __name__ == "__main__":
 
 !pip install pymongo
 !pip install certifi
+!pip install pyspark
+!pip install bs4
 
+from pyspark.sql import SparkSession
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
 import certifi
 from bs4 import BeautifulSoup
+from bson import ObjectId
 
+# SparkSession oluştur
+spark = SparkSession.builder \
+    .appName("MongoDB to Spark") \
+    .config("spark.mongodb.input.uri", "mongodb+srv://mehmet34:mehmet175e@atlascluster.j3z8vqq.mongodb.net/mydatabase.mycollection61?authSource=admin") \
+    .config("spark.mongodb.output.uri", "mongodb+srv://mehmet34:mehmet175e@atlascluster.j3z8vqq.mongodb.net/mydatabase.mycollection61?authSource=admin") \
+    .getOrCreate()
 
+def process_document(document):
+    text = document['data']
+    soup = BeautifulSoup(text, 'html.parser')
+
+    for tag in soup.find_all(["a", "img", "strong"]):
+        tag.decompose()
+
+    articles = soup.find_all("article")
+    if not articles:
+        warning_message = f"Uyarı: {document['url']} adresinde article etiketi bulunamadı."
+        return (document['_id'], warning_message, None, 0)
+
+    combined_text = ""
+    for article in articles:
+        paragraphs = article.find_all(["p", "h1", "h2"])
+        combined_text = " ".join(element.get_text() for element in paragraphs)
+
+    return (document['_id'], document['url'], combined_text, 1)
+
+# MongoDB'ye bağlan ve verileri çek
 try:
     client = MongoClient(
         "mongodb+srv://mehmet34:mehmet175e@atlascluster.j3z8vqq.mongodb.net/",
@@ -130,50 +161,42 @@ try:
     collection = db["mycollection61"]
 
     # İşlenmemiş verileri al
-    documents = collection.find({"data": {"$exists": True}, "state": 0})
+    documents = list(collection.find({"data": {"$exists": True}, "state": 0}))
 
     # İşlenmemiş veri yoksa mesaj ver
-    if collection.count_documents({"data": {"$exists": True}, "state": 0}) == 0:
+    if not documents:
         print("İşlenmemiş veri yok.")
     else:
+        # Belgeleri basit Python veri türlerine dönüştür
+        simplified_documents = []
         for document in documents:
-            text = document['data']
-            soup = BeautifulSoup(text, 'html.parser')
+            simplified_document = {
+                "_id": str(document["_id"]),
+                "url": document["url"],
+                "data": document["data"],
+                "state": document["state"]
+            }
+            simplified_documents.append(simplified_document)
 
-            #etiketleri temizle
-            for a_tag in soup.find_all("a"):
-                a_tag.decompose()
-            for img_tag in soup.find_all("img"):
-                img_tag.decompose()
-            for s_tag in soup.find_all("strong"):
-                s_tag.decompose()
+        # Spark DataFrame oluştur
+        rdd = spark.sparkContext.parallelize(simplified_documents)
+        df = spark.createDataFrame(rdd)
 
-            # Article etiketlerini bul ve işle
-            articles = soup.find_all("article")
-            print(document['url'])
-            print("\n")
+        # UDF ile işlemi Spark üzerinde dağıtık olarak gerçekleştir
+        processed_rdd = df.rdd.map(lambda row: process_document(row.asDict()))
+        processed_df = processed_rdd.toDF(["_id", "url", "data", "state"])
 
-            if not articles:
-                print(f"Uyarı: {document['url']} adresinde article etiketi bulunamadı.")
-                continue  # Eğer article etiketi yoksa bu dokümanı atla
-
-            text_sum_list = []
-            for article in articles:
-                paragraphs = article.find_all(["p", "h1", "h2"])
-                combined_text = " ".join(element.get_text() for element in paragraphs)
-            #    text_sum = combined_text.strip().split()
-             #   text_sum_list.extend(text_sum)
-
-            query = {"_id": document["_id"]}
-            new_data = {"$set": {"data": combined_text, "state": 1}}
-
+        # İşlenmiş verileri MongoDB'ye yaz
+        processed_documents = processed_df.collect()
+        for doc in processed_documents:
+            query = {"_id": ObjectId(doc['_id'])}  # String olarak saklanan ObjectId'yi geri dönüştür
+            new_data = {"$set": {"data": doc['data'], "state": 1}}
             try:
                 collection.update_one(query, new_data)
-                print("Veri başarıyla Ayrıştırıldı.")
+                print(f"Veri başarıyla ayrıştırıldı: {doc['url']}")
+                print(f"Ayrıştırılmış veri: {doc['data']}")
             except Exception as e:
-                print(e)
-
-            print("#########")
+                print(f"Veri güncellenirken hata oluştu: {e}")
 
 except ServerSelectionTimeoutError as err:
     print("MongoDB bağlantı hatası:", err)
@@ -183,17 +206,27 @@ except ServerSelectionTimeoutError as err:
 !pip install pandas xlrd
 !pip install gspread pandas gspread_dataframe
 
+from google.colab import files
+
+# Dosya yükleme arayüzünü açın
+uploaded = files.upload()
+
+# Yüklenen dosyaları pandas ile okuyun
+import pandas as pd
+
+# Dosya adını belirleyin
+file_name = list(uploaded.keys())[0]
+
 import pandas as pd
 from pymongo import MongoClient
 import certifi
 import bs4
 import numpy as np
 
-file_path = '/content/news.xls'
 
+# Dosyayı okuyun
+veri = pd.read_excel(file_name, engine='xlrd')
 
-# Excel dosyası xls
-veri = pd.read_excel(file_path, engine='xlrd')
 veri = veri[~veri['category'].isin(['dünya', 'genel','güncel','planet','türkiye'])]
 bos_degerler = veri['content'].isnull() | veri['content'].str.strip().eq('')
 veri = veri[~bos_degerler]
